@@ -1,0 +1,89 @@
+.\" Copyright (c) 2016
+.\"		Netflix Inc.
+.\"
+.\" Redistribution and use in source and binary forms, with or without
+.\" modification, are permitted provided that the following conditions
+.\" are met:
+.\" 1. Redistributions of source code must retain the above copyright
+.\"    notice, this list of conditions and the following disclaimer.
+.\" 2. Redistributions in binary form must reproduce the above copyright
+.\"    notice, this list of conditions and the following disclaimer in the
+.\"    documentation and/or other materials provided with the distribution.
+.\"
+.\" THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+.\" SUCH DAMAGE.
+.\"
+.\" $FreeBSD$
+.\"
+.Dd Oct 31, 2016
+.Dt tcplog_dumper 1
+.Os
+.Sh NAME
+.Nm tcplog_dumper
+.Nd Gather the data from the tcp logs.
+.Sh SYNOPSIS
+.Nm
+.Op Fl dhJ
+.Op Fl D Ar output-directory
+.Op Fl f Ar input-file
+.Op Fl p Ar pid-file
+.Op Fl u Ar username
+.Sh DESCRIPTION
+The
+.Nm
+utility is designed pull data from the TCP log buffers.
+It then writes appropriate records to disk.
+At present, it only supports the black box log records.
+.Pp
+The options are as follows:
+.Bl -tag -width indent
+.It Fl D
+Store the output files in
+.Va output-directory .
+Each record creates a separate file.
+In addition,
+.Nm
+keeps a record of all the files it produces in a file named "records".
+All of these files are stored in
+.Va output-directory .
+.It Fl d
+Daemonize the process.
+.It Fl f
+Read the input from
+.Va input-file .
+.It Fl h
+Display the help message.
+.It Fl J
+Compress the output using the XZ format.
+.It Fl p
+Write the PID to
+.Va pid-file .
+.It Fl u
+After opening the input file, set the UID and GID to those of
+.Va username .
+(By default, the program will try to become user "nobody".)
+.El
+.Pp
+All the flags are optional.
+To see the default values compiled into the program, use the
+.Fl h
+option.
+.Sh SEE ALSO
+.Xr xz 1
+.Sh BUGS
+The syslog integration is not complete; hence, all the output comes to the
+controlling terminal.
+.Pp
+There are many places where the program simply crashes rather than try to
+recover from an error.
+(However, these are not all bugs as there is no way to gracefully recover from
+a loss of synchronization with a stream of protocol data.)
