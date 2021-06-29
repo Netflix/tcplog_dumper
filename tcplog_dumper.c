@@ -26,6 +26,7 @@
  */
 
 #include <sys/param.h>
+#include <sys/endian.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
@@ -65,9 +66,6 @@
 
 static __inline u_int min(u_int a, u_int b) { return (a < b ? a : b); }
 
-#define	LCL_IP	htonl(0x0a000001)
-#define	RMT_IP	htonl(0x0a000002)
-
 /* PCAP-NG defines */
 #define	MAGIC_NG	0x1A2B3C4D
 #define	MAJOR_NG	1
@@ -81,6 +79,7 @@ static __inline u_int min(u_int a, u_int b) { return (a < b ? a : b); }
 
 #define	OPT_ENDOFOPT		0
 #define	OPT_COMMENT		1
+#define	OPT_EPB_FLAGS_WORD	2
 #define	OPT_CUST_BIN_COPY	2989
 #define	OPT_CUST_BIN_NOCOPY	2989
 
@@ -334,6 +333,12 @@ struct pcapng_epb {
 	uint8_t		pktdata[0];
 } __packed;
 
+struct pcapng_epb_flags_opt {
+	uint16_t	code;
+	uint16_t	len;
+	uint32_t	flags_word;
+} __packed;
+
 struct pcapng_nflx_block {
 	uint32_t	type;
 	uint32_t	len1;
@@ -477,22 +482,69 @@ static char junk[MAX_SNAPLEN];
 #define	CTASSERT(x)	_Static_assert(x, "Compile-time assertion failed")
 #endif
 
+/*
+ * pcap_epb_flags_opt() adds a EPB flags word option indicating the packet direction.
+ * This option is only included in the enhanced packet block.
+ */
+static int
+pcap_epb_flags_opt(bool inbound, struct iovec *iov, int *iovcnt, bitstr_t *free_map)
+{
+	struct pcapng_epb_flags_opt *epb_flags_opt;
+
+	epb_flags_opt = malloc(sizeof(struct pcapng_epb_flags_opt));
+	if (epb_flags_opt == NULL) {
+		warn("Error allocating space for the EPB flags word");
+		return (0);
+	}
+	epb_flags_opt->code = OPT_EPB_FLAGS_WORD;
+	epb_flags_opt->len = sizeof(uint32_t);
+	if (inbound) {
+		/* Inbound packet. */
+		epb_flags_opt->flags_word = 0x00000001;
+	} else {
+		/* Outbound packet. */
+		epb_flags_opt->flags_word = 0x00000002;
+	}
+	iov[*iovcnt].iov_base = epb_flags_opt;
+	iov[*iovcnt].iov_len = sizeof(struct pcapng_epb_flags_opt);
+	bit_set(free_map, *iovcnt);
+	(*iovcnt)++;
+	return (sizeof(struct pcapng_epb_flags_opt));
+}
+
+/*
+ * pcap_nflx_opt_alloc() allocates memory for a Netflix custom option.
+ * These options can be used in custom or standard blocks.
+ */
 static void *
-pcap_nflx_opt_alloc(uint32_t type, uint32_t len)
+pcap_nflx_opt_alloc(uint32_t type, uint32_t len, bool in_cb)
 {
 	struct pcapng_nflx_opt *opt;
 
+	assert(len + 8 <= UINT16_MAX);
 	opt = malloc(sizeof(struct pcapng_nflx_opt));
 	if (opt == NULL) {
 		warn("Error allocating space for an option buffer");
 		return (NULL);
 	}
 
-	opt->code = OPT_CUST_BIN_COPY;
-	assert(len + 8 <= UINT16_MAX);
-	opt->len = len + 8;
-	opt->pen = NFLX_PEN;
-	opt->nflx_type = type;
+	/*
+	 * When using this custom option in a custom block, store the code, len, and
+	 * pen in little endian.
+	 * In all other cases, store these fields in host byte order.
+	 * The custom option value, including the NFLX type, is always stored in
+	 * little endian.
+	 */
+	if (in_cb) {
+		opt->code = htole16(OPT_CUST_BIN_COPY);
+		opt->len = htole16(len + 8);
+		opt->pen = htole32(NFLX_PEN);
+	} else {
+		opt->code = OPT_CUST_BIN_COPY;
+		opt->len = len + 8;
+		opt->pen = NFLX_PEN;
+	}
+	opt->nflx_type = htole32(type);
 	return (opt);
 }
 
@@ -502,38 +554,61 @@ pcap_nflx_opt_alloc(uint32_t type, uint32_t len)
  */
 CTASSERT(offsetof(struct tcp_log_buffer, tlb_th) % 4 == 0);
 
+/*
+ * We also assume that time_t is a 64-bit entity, so basically this excludes i386.
+ */
+CTASSERT(sizeof(time_t) == 8);
+
+/*
+ * pcap_dumptime_opt() adds a custom option containing the time (in seconds since the
+ * Unix epoch) when the file was written.
+ * This custom option is only included in the section header block.
+ */
 static int
 pcap_dumptime_opt(time_t *dumptime, struct iovec *iov, int *iovcnt,
     bitstr_t *free_map)
 {
 	void *opt;
+	time_t *time;
 	int rv;
 
 	/*
 	 * Allocate the netflix option header and body. If either fails,
 	 * give up and return an error.
 	 */
-	opt = pcap_nflx_opt_alloc(NFLX_OPT_DUMPTIME, sizeof(time_t));
+	opt = pcap_nflx_opt_alloc(NFLX_OPT_DUMPTIME, sizeof(time_t), false);
 	if (opt == NULL)
 		return (0);
 
+	time = malloc(sizeof(time_t));
+	if (time == NULL) {
+		warn("Error allocating space for the dumptime");
+		free(opt);
+		return (0);
+	}
+	*time = htole64(*dumptime);
 	/*
 	 * Add the option header and body to the IOV. Because we allocated
-	 * space for the header, we also need to mark this in the free_map.
+	 * space for these, we also need to mark these in the free_map.
 	 */
 	iov[*iovcnt].iov_base = opt;
 	iov[*iovcnt].iov_len = sizeof(struct pcapng_nflx_opt);
 	rv = iov[*iovcnt].iov_len;
 	bit_set(free_map, *iovcnt);
 	(*iovcnt)++;
-	iov[*iovcnt].iov_base = dumptime;
+	iov[*iovcnt].iov_base = time;
 	iov[*iovcnt].iov_len = sizeof(time_t);
 	rv += iov[*iovcnt].iov_len;
+	bit_set(free_map, *iovcnt);
 	(*iovcnt)++;
 
 	return (rv);
 }
 
+/*
+ * pcap_version_opt() adds a custom option contaning the version of the file format.
+ * This custom option is only included in the section header block.
+ */
 static int
 pcap_version_opt(struct iovec *iov, int *iovcnt, bitstr_t *free_map)
 {
@@ -545,7 +620,7 @@ pcap_version_opt(struct iovec *iov, int *iovcnt, bitstr_t *free_map)
 	 * Allocate the netflix option header and body. If either fails,
 	 * give up and return an error.
 	 */
-	opt = pcap_nflx_opt_alloc(NFLX_OPT_VERSION, sizeof(uint32_t));
+	opt = pcap_nflx_opt_alloc(NFLX_OPT_VERSION, sizeof(uint32_t), false);
 	if (opt == NULL)
 		return (0);
 
@@ -560,7 +635,7 @@ pcap_version_opt(struct iovec *iov, int *iovcnt, bitstr_t *free_map)
 	 * We checked the log format version at startup. So, we can
 	 * statically compile that here.
 	 */
-	*version = TCP_LOG_BUF_VER;
+	*version = htole32(TCP_LOG_BUF_VER);
 
 	/*
 	 * Add the option header and body to the IOV. Because we allocated
@@ -580,34 +655,76 @@ pcap_version_opt(struct iovec *iov, int *iovcnt, bitstr_t *free_map)
 	return (rv);
 }
 
+/*
+ * We  assume that struct timeval consists of two 64-bit entities, so basically assumes
+ * a 64-bit platform.
+ */
+CTASSERT(sizeof(struct timeval) == 16);
+
+/*
+ * pcap_dumpinfo_opt() adds a custom option contaning the stack ID and stack name.
+ * This custom option is only included in the section header block.
+ */
 static int
 pcap_dumpinfo_opt(struct tcp_log_header *hdr, struct iovec *iov, int *iovcnt,
     bitstr_t *free_map)
 {
 	void *opt;
+	struct tcp_log_header *hdr_le;
 	int rv;
 
 	opt = pcap_nflx_opt_alloc(NFLX_OPT_DUMPINFO,
-	    sizeof(struct tcp_log_header));
+	    sizeof(struct tcp_log_header), false);
 	if (opt == NULL)
 		return (0);
 
-	/* We allocated space. Mark the fact that we will need to clear it. */
-	bit_set(free_map, *iovcnt);
+#if BYTE_ORDER == LITTLE_ENDIAN
+	hdr_le = hdr;
+#else
+	hdr_le = malloc(sizeof(struct tcp_log_header));
+	if (hdr_le == NULL) {
+		warn("Error allocating space for the tcp_log_header");
+		free(opt);
+		return (0);
+	}
+	/*
+	 * Convert all fields, except the endpoint information, to litte endian.
+	 * Keep the endpoint information in network byte order, aka big endian.
+	 */
+	hdr_le->tlh_version = htole32(hdr->tlh_version);
+	hdr_le->tlh_type = htole32(hdr->tlh_type);
+	hdr_le->tlh_length = htole64(hdr->tlh_length);
+	hdr_le->tlh_ie = hdr->tlh_ie;
+	hdr_le->tlh_offset.tv_sec = htole64(hdr->tlh_offset.tv_sec);
+	hdr_le->tlh_offset.tv_usec = htole64(hdr->tlh_offset.tv_usec);
+	memcpy(hdr_le->tlh_id, hdr->tlh_id ,TCP_LOG_ID_LEN);
+	memcpy(hdr_le->tlh_reason, hdr->tlh_reason, TCP_LOG_REASON_LEN);
+	memcpy(hdr_le->tlh_tag, hdr->tlh_tag, TCP_LOG_TAG_LEN);
+	hdr_le->tlh_af = hdr->tlh_af;
+	memcpy(hdr_le->_pad, hdr->_pad, 7);
+#endif
 
 	/* Update the IOV. */
 	iov[*iovcnt].iov_base = opt;
 	iov[*iovcnt].iov_len = sizeof(struct pcapng_nflx_opt);
 	rv = iov[*iovcnt].iov_len;
+	bit_set(free_map, *iovcnt);
 	(*iovcnt)++;
-	iov[*iovcnt].iov_base = hdr;
+	iov[*iovcnt].iov_base = hdr_le;
 	iov[*iovcnt].iov_len = sizeof(struct tcp_log_header);
 	rv += iov[*iovcnt].iov_len;
+#if BYTE_ORDER == BIG_ENDIAN
+	bit_set(free_map, *iovcnt);
+#endif
 	(*iovcnt)++;
 
 	return (rv);
 }
 
+/*
+ * pcap_stackname_opt() adds a custom option containing the stack ID and stack name.
+ * This custom option is only included in the section header block.
+ */
 static int pcap_stackname_opt(uint8_t *stackid, struct iovec *iov, int *iovcnt,
     bitstr_t *free_map) __locks_shared(stacknames_lock);
 static int
@@ -647,7 +764,7 @@ pcap_stackname_opt(uint8_t *stackid, struct iovec *iov, int *iovcnt,
 	}
 
 	stacknamelen = strlen(stackname);
-	opt = pcap_nflx_opt_alloc(NFLX_OPT_STACKNAME, stacknamelen + 1);
+	opt = pcap_nflx_opt_alloc(NFLX_OPT_STACKNAME, stacknamelen + 1, false);
 	if (opt == NULL)
 		return (0);
 
@@ -680,29 +797,221 @@ pcap_stackname_opt(uint8_t *stackid, struct iovec *iov, int *iovcnt,
 	return (rv);
 }
 
+/*
+ * pcap_tcpbuf_opt() adds a custom option containing information about the current state
+ * of the TCP stack.
+ * This custom option is used in the enhanced packet block and also in the custom block
+ * (the event block).
+ */
 static int
-pcap_tcpbuf_opt(struct tcp_log_buffer *tlb, struct iovec *iov, int *iovcnt,
+pcap_tcpbuf_opt(struct tcp_log_buffer *tlb, bool in_cb, struct iovec *iov, int *iovcnt,
     bitstr_t *free_map)
 {
 	void *opt;
+	struct tcp_log_buffer *tlb_le;
+#if (BYTE_ORDER == BIG_ENDIAN) && defined(NETFLIX_TCP_STACK)
+	union tcp_log_userdata *tlu, *tlu_le;
+	unsigned int i;
+#endif
 	int rv;
 
 	opt = pcap_nflx_opt_alloc(NFLX_OPT_TCPINFO,
-	    offsetof(struct tcp_log_buffer, tlb_th));
+	    offsetof(struct tcp_log_buffer, tlb_th), in_cb);
 	if (opt == NULL)
 		return (0);
 
-	/* We allocated space. Mark the fact that we will need to clear it. */
-	bit_set(free_map, *iovcnt);
+#if BYTE_ORDER == LITTLE_ENDIAN
+	tlb_le = tlb;
+#else
+	tlb_le = malloc(sizeof(struct tcp_log_buffer));
+	if (tlb_le == NULL) {
+		warn("Error allocating space for the tcp_log_buffer");
+		free(opt);
+		return (0);
+	}
+	/* Convert all fields to litte endian. */
+	tlb_le->tlb_tv.tv_sec = htole64(tlb->tlb_tv.tv_sec);
+	tlb_le->tlb_tv.tv_usec = htole64(tlb->tlb_tv.tv_usec);
+	tlb_le->tlb_ticks = htole32(tlb->tlb_ticks);
+	tlb_le->tlb_sn = htole32(tlb->tlb_sn);
+	tlb_le->tlb_stackid = tlb->tlb_stackid;
+	tlb_le->tlb_eventid = tlb->tlb_eventid;
+	tlb_le->tlb_eventflags = htole16(tlb->tlb_eventflags);
+	tlb_le->tlb_errno = htole32(tlb->tlb_errno);
+	tlb_le->tlb_rxbuf.tls_sb_acc = htole32(tlb->tlb_rxbuf.tls_sb_acc);
+	tlb_le->tlb_rxbuf.tls_sb_ccc = htole32(tlb->tlb_rxbuf.tls_sb_ccc);
+	tlb_le->tlb_rxbuf.tls_sb_spare = htole32(tlb->tlb_rxbuf.tls_sb_spare);
+	tlb_le->tlb_txbuf.tls_sb_acc = htole32(tlb->tlb_txbuf.tls_sb_acc);
+	tlb_le->tlb_txbuf.tls_sb_ccc = htole32(tlb->tlb_txbuf.tls_sb_ccc);
+	tlb_le->tlb_txbuf.tls_sb_spare = htole32(tlb->tlb_txbuf.tls_sb_spare);
+	tlb_le->tlb_state = htole32(tlb->tlb_state);
+	tlb_le->tlb_starttime = htole32(tlb->tlb_starttime);
+	tlb_le->tlb_iss = htole32(tlb->tlb_iss);
+	tlb_le->tlb_flags = htole32(tlb->tlb_flags);
+	tlb_le->tlb_snd_una = htole32(tlb->tlb_snd_una);
+	tlb_le->tlb_snd_max = htole32(tlb->tlb_snd_max);
+	tlb_le->tlb_snd_cwnd = htole32(tlb->tlb_snd_cwnd);
+	tlb_le->tlb_snd_nxt = htole32(tlb->tlb_snd_nxt);
+	tlb_le->tlb_snd_recover = htole32(tlb->tlb_snd_recover);
+	tlb_le->tlb_snd_wnd = htole32(tlb->tlb_snd_wnd);
+	tlb_le->tlb_snd_ssthresh = htole32(tlb->tlb_snd_ssthresh);
+	tlb_le->tlb_srtt = htole32(tlb->tlb_srtt);
+	tlb_le->tlb_rttvar = htole32(tlb->tlb_rttvar);
+	tlb_le->tlb_rcv_up = htole32(tlb->tlb_rcv_up);
+	tlb_le->tlb_rcv_adv = htole32(tlb->tlb_rcv_adv);
+	tlb_le->tlb_flags2 = htole32(tlb->tlb_flags2);
+	tlb_le->tlb_rcv_nxt = htole32(tlb->tlb_rcv_nxt);
+	tlb_le->tlb_rcv_wnd = htole32(tlb->tlb_rcv_wnd);
+	tlb_le->tlb_dupacks = htole32(tlb->tlb_dupacks);
+	tlb_le->tlb_segqlen = htole32(tlb->tlb_segqlen);
+	tlb_le->tlb_snd_numholes = htole32(tlb->tlb_snd_numholes);
+	tlb_le->tlb_flex1 = htole32(tlb->tlb_flex1);
+	tlb_le->tlb_flex2 = htole32(tlb->tlb_flex2);
+	tlb_le->tlb_fbyte_in = htole32(tlb->tlb_fbyte_in);
+	tlb_le->tlb_fbyte_out = htole32(tlb->tlb_fbyte_out);
+	tlb_le->tlb_snd_scale = tlb->tlb_rcv_scale;
+	tlb_le->tlb_rcv_scale = tlb->tlb_snd_scale;
+	memcpy(tlb_le->_pad, tlb->_pad, 3);
+	switch (tlb->tlb_eventid) {
+#ifdef NETFLIX_TCP_STACK
+	case TCP_LOG_SENDFILE:
+		tlb_le->tlb_stackinfo.u_sf.offset =
+		    htole64(tlb->tlb_stackinfo.u_sf.offset);
+		tlb_le->tlb_stackinfo.u_sf.length =
+		    htole64(tlb->tlb_stackinfo.u_sf.length);
+		tlb_le->tlb_stackinfo.u_sf.flags =
+		    htole32(tlb->tlb_stackinfo.u_sf.flags);
+		/*
+		 * Copy over the rest without modification, since the structure is not
+		 * known. It should be padding.
+		 */
+		memcpy((char *)tlb_le + sizeof(struct tcp_log_sendfile),
+		    (char *)tlb + sizeof(struct tcp_log_sendfile),
+		    sizeof(union tcp_log_stackspecific) -
+		    sizeof(struct tcp_log_sendfile));
+		break;
+	case TCP_LOG_USER_EVENT:
+		tlu = (union tcp_log_userdata *)tlb;
+		tlu_le = (union tcp_log_userdata *)tlb_le;
+		switch (tlb->flex1) {
+		case TCP_LOG_USER_HTTPD:
+			tlu_le->http_req.timestamp = htole64(tlu_le->http_req.timestamp);
+			tlu_le->http_req.start = htole64(tlu_le->http_req.start);
+			tlu_le->http_req.end = htole64(tlu_le->http_req.end);
+			tlu_le->http_req.flags = htole32(tlu_le->http_req.flags);
+			/*
+			 * Copy over the rest without modification, since the structure
+			 * is not known. It should be padding.
+			 */
+			memcpy((char *)tlu_le + sizeof(union tcp_log_userdata),
+			    (char *)tlu + sizeof(union tcp_log_userdata),
+			    sizeof(union tcp_log_stackspecific) -
+			    sizeof(union tcp_log_userdata));
+			break;
+		default:
+			/*
+			 * Copy over without modification, since the structure is not
+			 * known.
+			 */
+			memcpy(tlu_le, tlu, sizeof(union tcp_log_stackspecific));
+			break;
+		}
+		break;
+	case TCP_LOG_ACCOUNTING:
+		for (i = 0; i < 4; i++) {
+			tlb_le->tlb_stackinfo.u_raw.u64_flex[i] =
+			    htole64(tlb->tlb_stackinfo.u_raw.u64_flex[i]);
+		}
+		for (i = 0; i < 14; i++) {
+			tlb_le->tlb_stackinfo.u_raw.u32_flex[i] =
+			    htole32(tlb->tlb_stackinfo.u_raw.u32_flex[i]);
+		}
+		for (i = 0; i < 3; i++) {
+			tlb_le->tlb_stackinfo.u_raw.u16_flex[i] =
+			    htole16(tlb->tlb_stackinfo.u_raw.u16_flex[i]);
+		}
+		for (i = 0; i < 6; i++) {
+			tlb_le->tlb_stackinfo.u_raw.u8_flex[i] =
+			    tlb->tlb_stackinfo.u_raw.u8_flex[i];
+		}
+		tlb_le->tlb_stackinfo.u_raw.u32_flex2[0] =
+		    htole32(tlb->tlb_stackinfo.u_raw.u32_flex2[0]);
+		break;
+#endif
+	default:
+		tlb_le->tlb_stackinfo.u_bbr.cur_del_rate =
+		    htole64(tlb->tlb_stackinfo.u_bbr.cur_del_rate);
+		tlb_le->tlb_stackinfo.u_bbr.delRate =
+		    htole64(tlb->tlb_stackinfo.u_bbr.delRate);
+		tlb_le->tlb_stackinfo.u_bbr.rttProp =
+		    htole64(tlb->tlb_stackinfo.u_bbr.rttProp);
+		tlb_le->tlb_stackinfo.u_bbr.bw_inuse =
+		    htole64(tlb->tlb_stackinfo.u_bbr.bw_inuse);
+		tlb_le->tlb_stackinfo.u_bbr.inflight =
+		    htole32(tlb->tlb_stackinfo.u_bbr.inflight);
+		tlb_le->tlb_stackinfo.u_bbr.applimited =
+		    htole32(tlb->tlb_stackinfo.u_bbr.applimited);
+		tlb_le->tlb_stackinfo.u_bbr.delivered =
+		    htole32(tlb->tlb_stackinfo.u_bbr.delivered);
+		tlb_le->tlb_stackinfo.u_bbr.timeStamp =
+		    htole32(tlb->tlb_stackinfo.u_bbr.timeStamp);
+		tlb_le->tlb_stackinfo.u_bbr.epoch =
+		    htole32(tlb->tlb_stackinfo.u_bbr.epoch);
+		tlb_le->tlb_stackinfo.u_bbr.lt_epoch =
+		    htole32(tlb->tlb_stackinfo.u_bbr.lt_epoch);
+		tlb_le->tlb_stackinfo.u_bbr.pkts_out =
+		    htole32(tlb->tlb_stackinfo.u_bbr.pkts_out);
+		tlb_le->tlb_stackinfo.u_bbr.flex1 =
+		    htole32(tlb->tlb_stackinfo.u_bbr.flex1);
+		tlb_le->tlb_stackinfo.u_bbr.flex2 =
+		    htole32(tlb->tlb_stackinfo.u_bbr.flex2);
+		tlb_le->tlb_stackinfo.u_bbr.flex3 =
+		    htole32(tlb->tlb_stackinfo.u_bbr.flex3);
+		tlb_le->tlb_stackinfo.u_bbr.flex4 =
+		    htole32(tlb->tlb_stackinfo.u_bbr.flex4);
+		tlb_le->tlb_stackinfo.u_bbr.flex5 =
+		    htole32(tlb->tlb_stackinfo.u_bbr.flex5);
+		tlb_le->tlb_stackinfo.u_bbr.flex6 =
+		    htole32(tlb->tlb_stackinfo.u_bbr.flex6);
+		tlb_le->tlb_stackinfo.u_bbr.lost =
+		    htole32(tlb->tlb_stackinfo.u_bbr.lost);
+		tlb_le->tlb_stackinfo.u_bbr.pacing_gain =
+		    htole16(tlb->tlb_stackinfo.u_bbr.pacing_gain);
+		tlb_le->tlb_stackinfo.u_bbr.cwnd_gain =
+		    htole16(tlb->tlb_stackinfo.u_bbr.cwnd_gain);
+		tlb_le->tlb_stackinfo.u_bbr.flex7 =
+		    htole16(tlb->tlb_stackinfo.u_bbr.flex7);
+		tlb_le->tlb_stackinfo.u_bbr.bbr_state =
+		    tlb->tlb_stackinfo.u_bbr.bbr_state;
+		tlb_le->tlb_stackinfo.u_bbr.bbr_substate =
+		    tlb->tlb_stackinfo.u_bbr.bbr_substate;
+		tlb_le->tlb_stackinfo.u_bbr.inhpts =
+		    tlb->tlb_stackinfo.u_bbr.inhpts;
+		tlb_le->tlb_stackinfo.u_bbr.ininput =
+		    tlb->tlb_stackinfo.u_bbr.ininput;
+		tlb_le->tlb_stackinfo.u_bbr.use_lt_bw =
+		    tlb->tlb_stackinfo.u_bbr.use_lt_bw;
+		tlb_le->tlb_stackinfo.u_bbr.flex8 =
+		    tlb->tlb_stackinfo.u_bbr.flex8;
+		tlb_le->tlb_stackinfo.u_bbr.pkt_epoch =
+		    htole32(tlb->tlb_stackinfo.u_bbr.pkt_epoch);
+		break;
+	}
+	tlb_le->tlb_len = htole32(tlb->tlb_len);
+#endif
 
 	/* Update the IOV. */
 	iov[*iovcnt].iov_base = opt;
 	iov[*iovcnt].iov_len = sizeof(struct pcapng_nflx_opt);
 	rv = iov[*iovcnt].iov_len;
+	bit_set(free_map, *iovcnt);
 	(*iovcnt)++;
-	iov[*iovcnt].iov_base = tlb;
+	iov[*iovcnt].iov_base = tlb_le;
 	iov[*iovcnt].iov_len = offsetof(struct tcp_log_buffer, tlb_th);
 	rv += iov[*iovcnt].iov_len;
+#if BYTE_ORDER == BIG_ENDIAN
+	bit_set(free_map, *iovcnt);
+#endif
 	(*iovcnt)++;
 
 	return (rv);
@@ -784,7 +1093,8 @@ pcap_packetblock(struct tcp_log_buffer *buf, struct extract_context *ctx)
 	 * [1]: IP HDR
 	 * [2]: TCP HDR
 	 * [3]: Padding (to the snaplen)
-	 * [4]: Option
+	 * [4]: EPB flags word option
+	 * [5]: Option
 	 * [n-1]: Options
 	 * [n]: end-of-option-list option and total block length
 	 */
@@ -825,7 +1135,11 @@ pcap_packetblock(struct tcp_log_buffer *buf, struct extract_context *ctx)
 	}
 
 	/* Add tcp info option. */
-	epb.len1 += pcap_tcpbuf_opt(buf, iov, &iovcnt, free_map);
+	epb.len1 += pcap_tcpbuf_opt(buf, false, iov, &iovcnt, free_map);
+
+	/* Add an EPB flags word option to indicate the direction. */
+	epb.len1 += pcap_epb_flags_opt(buf->tlb_eventid == TCP_LOG_IN, iov, &iovcnt,
+	    free_map);
 
 	/*
 	 * Tack on the end of the block.
@@ -858,7 +1172,7 @@ pcap_init_custom_block(struct pcapng_nflx_block *hdr, uint32_t type)
 {
 	hdr->type = BT_CB_COPY;
 	hdr->pen = NFLX_PEN;
-	hdr->nflx_type = type;
+	hdr->nflx_type = htole32(type);
 }
 
 static int
@@ -885,7 +1199,7 @@ pcap_eventblock(struct tcp_log_buffer *buf, struct extract_context *ctx)
 	iovcnt = 1;
 
 	/* Add tcp info option. */
-	eb.hdr.len1 += pcap_tcpbuf_opt(buf, iov, &iovcnt, free_map);
+	eb.hdr.len1 += pcap_tcpbuf_opt(buf, true, iov, &iovcnt, free_map);
 
 	/*
 	 * Tack on the end of the block.
@@ -927,7 +1241,7 @@ pcap_skippedblock(struct extract_context *ctx, uint32_t num_skipped)
 	/* Initialize the skipped block header. */
 	pcap_init_custom_block(&sb.hdr, NFLX_SKIPPED_BLOCK);
 	sb_end.blocklen = sb.hdr.len1 = sizeof(sb) + sizeof(sb_end);
-	sb.num_skipped = num_skipped;
+	sb.num_skipped = htole32(num_skipped);
 	iov[0].iov_base = &sb;
 	iov[0].iov_len = sizeof(sb);
 
