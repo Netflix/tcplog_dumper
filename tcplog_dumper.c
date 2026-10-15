@@ -986,8 +986,8 @@ pcap_tcpbuf_opt(struct tcp_log_buffer *tlb, bool in_cb, struct iovec *iov, int *
 		    tlb->tlb_stackinfo.u_bbr.bbr_substate;
 		tlb_le->tlb_stackinfo.u_bbr.inhpts =
 		    tlb->tlb_stackinfo.u_bbr.inhpts;
-		tlb_le->tlb_stackinfo.u_bbr.ininput =
-		    tlb->tlb_stackinfo.u_bbr.ininput;
+		tlb_le->tlb_stackinfo.u_bbr.__spare =
+		    tlb->tlb_stackinfo.u_bbr.__spare;
 		tlb_le->tlb_stackinfo.u_bbr.use_lt_bw =
 		    tlb->tlb_stackinfo.u_bbr.use_lt_bw;
 		tlb_le->tlb_stackinfo.u_bbr.flex8 =
